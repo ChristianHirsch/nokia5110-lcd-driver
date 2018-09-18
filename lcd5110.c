@@ -5,6 +5,7 @@
 #include <linux/delay.h>
 #include <linux/gpio.h>
 #include <linux/slab.h>
+#include <linux/uaccess.h>
 #include <asm/uaccess.h>
 
 MODULE_LICENSE("Dual BSD/GPL");
