@@ -1,25 +1,11 @@
 /* Necessary includes for drivers */
 #include <linux/init.h>
-#include <linux/config.h>
 #include <linux/module.h>
-#include <linux/kernel.h>	/* printk() */
-#include <linux/slab.h>		/* kmalloc() */
-#include <linux/fs.h>		/* everything... */
-#include <linux/errno.h>	/* error codes */
-#include <linux/types.h>	/* size_t */
-#include <linux/proc_fs.h>
-#include <linux/fcntl.h>	/* O_ACCMODE */
-#include <linux/ioport.h>
-#include <asm/system.h>		/* cli(), *_flags */
-#include <asm/uaccess.h>	/* copy_from/to_user */
-#include <asm/io.h>		/* inb, outb */
-
-/* Necessary includes for lcd stuff */
-#include <stdio.h>
-#include <stdlib.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
+#include <linux/gpio.h>
+#include <linux/slab.h>
+#include <asm/uaccess.h>
 
 MODULE_LICENSE("Dual BSD/GPL");
 
@@ -157,19 +143,13 @@ static const unsigned short ASCII[][5] =
 #define PAGE_SIZE (4*1024)
 #define BLOCK_SIZE (4*1024)
 
-#define GPIO_SET *(gpio+7)  // sets   bits which are 1 ignores bits which are 0
-#define GPIO_CLR *(gpio+10) // clears bits which are 1 ignores bits which are 0
-
-// reset input (active low)
-#define RES	4
-// chip enable (active low)
-#define SCE	22
-// data / -command
-#define DC	9
-// serial data in
-#define SDIN	10
-// serial clock
-#define SCLK	11
+#define RES   17 // 0
+#define SCE   18 // 1
+#define DC    27 // 2
+#define SDIN  22 // 3
+#define SCLK  23 // 4
+#define TMP0  24 // 5
+#define TMP1  25 // 6
 
 #define LCD_WIDTH 84
 #define LCD_HEIGHT 48
@@ -177,27 +157,11 @@ static const unsigned short ASCII[][5] =
 #define LCD_C	0
 #define LCD_D	1
 
-int  mem_fd;
-char *gpio_map;
-
-// I/O access
-volatile unsigned *gpio;
-
-// GPIO setup macros. Always use INP_GPIO(x) before using OUT_GPIO(x) or SET_GPIO_ALT(x,y)
-#define INP_GPIO(g) *(gpio+((g)/10)) &= ~(7<<(((g)%10)*3))
-#define OUT_GPIO(g) *(gpio+((g)/10)) |=  (1<<(((g)%10)*3))
-#define SET_GPIO_ALT(g,a) *(gpio+(((g)/10))) |= (((a)<=3?(a)+4:(a)==4?3:2)<<(((g)%10)*3))
-void setup_io();
-void initLcdPorts();
-void initLcdScreen();
+void initLcdScreen(void);
+void clearLcdScreen(void);
 void sendByteToLcd(bool, unsigned char);
-void clearLcdScreen();
 void writeCharToLcd(char);
 void writeStringToLcd(char *);
-
-
-
-/* --- D R I V E R   S T A R T S   H E R E --------------------------------- */
 
 module_init(lcd5110_init);
 module_exit(lcd5110_exit);
@@ -205,47 +169,47 @@ module_exit(lcd5110_exit);
 int lcd5110_init(void) {
 	int result;
 
-	/* Registering device */
-  	result = register_chrdev(lcd5110_major, "lcd5110",
-		&lcd5110_fops);
-	if (result < 0) {
-    		printk(
-			"<1>lcd5110: cannot obtain major number %d\n",
-			lcd5110_major);
+	// register char device
+	result = register_chrdev(lcd5110_major, "lcd5110",
+			&lcd5110_fops);
+	if(result < 0)
+	{
+		printk("lcd5110: error obtaining major number %d\n",
+				lcd5110_major);
 		return result;
 	}
 
-	/* Registering port */
-	port = check_region(0x378, 1);
-	if (port)
-	{
-		printk("<1>lcd5110: cannot reserve 0x378\n");
-		result = port;
-		goto fail;
-	}
+	// request and set GPIO ports for lcd display to output
+	int pins[5] = {RES, SCE, DC, SDIN, SCLK};
+	char **pins_name = { "RES", "SCE", "DC", "SDIN", "SCLK" };
+        for (int g=0; g<6; g++)
+        {
+		gpio_request(pins[g], pins_name[g]);
+        }
+        for (int g=0; g<6; g++)
+        {
+		gpio_direction_output(pins[g], 0);
+        }
 
-	//request_region(0x378, 1, "lcd5110");
+	initLcdScreen();
+	clearLcdScreen();
+	writeStringToLcd("LCD initialized");
 
-	printk("<1>Inserting lcd5110 module\n");
+	printk("Inserting lcd5110 module\n");
 	return 0;
-
-fail:
-	lcd5110_exit();
-	return result;
 }
 
 void lcd5110_exit(void)
 {
-	/* Make major number free! */
 	unregister_chrdev(lcd5110_major, "lcd5110");
 
-	/* Make port free! */
-	if (!port)
-	{
-		release_region(0x378,1);
-	}
+	int pins[5] = {RES, SCE, DC, SDIN, SCLK};
+        for (int g=0; g<6; g++)
+        {
+		gpio_free(pins[g]);
+        }
 
-	printk("<1>Removing lcd5110 module\n");
+	printk("Removing lcd5110 module\n");
 }
 
 int lcd5110_open(struct inode *inode, struct file *filp)
@@ -263,110 +227,41 @@ int lcd5110_release(struct inode *inode, struct file *filp)
 ssize_t lcd5110_read(struct file *filp, char *buf,
 	size_t count, loff_t *f_pos)
 {
-	/* Buffer to read the device */
-	char lcd5110_buffer;
-
-	/* Reading port */
-	lcd5110_buffer = inb(0x378);
-
-	/* We transfer data to user space */
-	copy_to_user(buf,&lcd5110_buffer,1);
-	/* We change the reading position as best suits */
-	if (*f_pos == 0)
-	{
-		*f_pos+=1;
-		return 1;
-  	} else
-	{
-		return 0;
-	}
+	return 0;
 }
 
-ssize_t lcd5110_write( struct file *filp, char *buf,
-	size_t count, loff_t *f_pos)
+ssize_t lcd5110_write( struct file *filp, char *ubuf,
+	const size_t count, loff_t *f_pos)
 {
-	char *tmp;
-
 	/* Buffer writing to the device */
-	char lcd5110_buffer;
+	char *kbuf = kcalloc((count + 1), sizeof(char), GFP_KERNEL);
 
-	tmp=buf+count-1;
-	copy_from_user(&lcd5110_buffer,tmp,1);
+	if(copy_from_user(kbuf, ubuf, count) != 0)
+	{
+		kfree(kbuf);
+		return -EFAULT;
+	}
 
-	/* Writing to the port */
-	outb(lcd5110_buffer,0x378);
+	kbuf[count-1] = 0;
 
-	return 1;
+	clearLcdScreen();
+	writeStringToLcd(kbuf);
+	kfree(kbuf);
+	
+	return count;
 }
 
 
 /* --- L C D   S T A R T S   H E R E --------------------------------------- */
 
-//
-// Set up a memory regions to access GPIO
-//
-void setup_io()
-{
-   /* open /dev/mem */
-   if ((mem_fd = open("/dev/mem", O_RDWR|O_SYNC) ) < 0) {
-      printf("can't open /dev/mem \n");
-      exit(-1);
-   }
-
-   /* mmap GPIO */
-   gpio_map = (char *)mmap(
-      NULL,             //Any adddress in our space will do
-      BLOCK_SIZE,       //Map length
-      PROT_READ|PROT_WRITE,// Enable reading & writting to mapped memory
-      MAP_SHARED,       //Shared with other processes
-      mem_fd,           //File to map
-      GPIO_BASE         //Offset to GPIO peripheral
-   );
-
-   close(mem_fd); //No need to keep mem_fd open after mmap
-
-   if ((long)gpio_map < 0) {
-      printf("mmap error %d\n", (int)gpio_map);
-      exit(-1);
-   }
-
-   // Always use volatile pointer!
-   gpio = (volatile unsigned *)gpio_map;
-
-} // setup_io
-
-void initLcdPorts()
-{
-        // Set up gpi pointer for direct register access
-        setup_io();
-
-        // Switch GPIOs for LCD to output mode
-
-        /************************************************************************\
-         * You are about to change the GPIO settings of your computer.          *
-         * Mess this up and it will stop working!                               *
-         * It might be a good idea to 'sync' before running this program        *
-         * so at least you still have your code changes written to the SD-card! *
-        \************************************************************************/
-
-	int pins[5] = {RES, SCE, DC, SDIN, SCLK};
-
-        // Set GPIO pins to output
-        for (int g=0; g<6; g++)
-        {
-                INP_GPIO(pins[g]); // must use INP_GPIO before we can use OUT_GPIO
-                OUT_GPIO(pins[g]);
-        }
-}
-
 void initLcdScreen()
 {
 	// set GPIOs
-	GPIO_CLR = 1 << SCE;
-	GPIO_CLR = 1 << SCLK;
-	GPIO_CLR = 1 << RES;
-	usleep(2);
-	GPIO_SET = 1 << RES;
+	gpio_set_value(SCE, false);
+	gpio_set_value(SCLK, false);
+	gpio_set_value(RES, false);
+	udelay(2);
+	gpio_set_value(RES, true);
 
 	// init LCD
 	sendByteToLcd(LCD_C, 0x21);	// LCD Extended Commands
@@ -383,21 +278,22 @@ void initLcdScreen()
 void sendByteToLcd(bool cd, unsigned char data)
 {
 	if(cd)
-		GPIO_SET = 1 << DC;
+		gpio_set_value(DC, true);
 	else
-		GPIO_CLR = 1 << DC;
+		gpio_set_value(DC, false);
 
 	unsigned char pattern = 0b10000000;
 	for(int i=0; i < 8; i++)
 	{
-		GPIO_CLR = 1 << SCLK;
+		gpio_set_value(SCLK, false);
 		if(data & pattern)
-			GPIO_SET = 1 << SDIN;
+			gpio_set_value(SDIN, true);
 		else
-			GPIO_CLR = 1 << SDIN;
-		usleep(1);
-		GPIO_SET = 1 << SCLK;
-		usleep(1);
+			gpio_set_value(SDIN, false);
+
+		udelay(1);
+		gpio_set_value(SCLK, true);
+		udelay(1);
 		pattern >>= 1;
 	}
 }
@@ -406,6 +302,9 @@ void clearLcdScreen()
 {
 	for(int i=0; i < LCD_WIDTH * LCD_HEIGHT / 8; i++)
 		sendByteToLcd(LCD_D, 0x00);
+
+	sendByteToLcd(LCD_C, 0x80 | 0); // set x coordinate to 0
+	sendByteToLcd(LCD_C, 0x40 | 0); // set y coordinate to 0
 }
 
 void writeCharToLcd(char data)
